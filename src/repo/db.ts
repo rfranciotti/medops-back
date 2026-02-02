@@ -19,3 +19,15 @@ db.exec(`
     created_at TEXT NOT NULL
   );
 `);
+try {
+  db.exec(`ALTER TABLE cases ADD COLUMN student_provider TEXT`);
+} catch {}
+try {
+  db.exec(`ALTER TABLE cases ADD COLUMN student_error TEXT`);
+} catch {}
+try {
+  db.exec(`ALTER TABLE cases ADD COLUMN teacher_provider TEXT`);
+} catch {}
+try {
+  db.exec(`ALTER TABLE cases ADD COLUMN teacher_error TEXT`);
+} catch {}
