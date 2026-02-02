@@ -1,0 +1,17 @@
+{
+  "meta": {
+    "schema_version": "student_facts_v1",
+    "language": "pt-BR",
+    "source": "fixture"
+  },
+  "context": {
+    "setting": "PS",
+    "date_reference": null,
+    "time_reference": null
+  },
+  "presenting_problem": { "chief_complaint": null },
+  "vitals": null,
+  "medications": [],
+  "exams": [],
+  "uncertainties": ["história confusa", "tempo de início incerto"]
+}
