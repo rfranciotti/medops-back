@@ -48,6 +48,8 @@ Rules:
 
 Patient data extraction rules:
 - age: extract as number if present (e.g., "74a" -> 74).
+- weight_kg: extract numeric value if present (e.g., "67kg" -> 67).
+- height_m: extract numeric value in meters if present (e.g., "1.70m" -> 1.7).
 - sex: extract as "M" or "F" ONLY if explicitly stated in the text (e.g., "sexo M", "homem", "mulher"). Otherwise null.
 - name: extract only if explicitly stated.
 - context.setting: extract location details. Include modality ONLY if explicitly mentioned.
@@ -128,7 +130,7 @@ uncertainties (STRICT FORMAT - Array of STRINGS):
 Output schema (STRICT JSON):
 {
   "meta": { "schema_version": "student_facts_v1", "language": "pt-BR", "source": "free_text" },
-  "patient": { "name": null, "age": null, "sex": null },
+  "patient": { "name": null, "age": null, "sex": null, "weight_kg": null, "height_m": null },
   "context": { "setting": null, "date_reference": null, "time_reference": null },
   "presenting_problem": { "chief_complaint": null, "duration": null, "onset": null, "additional_symptoms": [] },
   "comorbidities": [],

@@ -50,28 +50,28 @@ export function runGate(student_facts: any, raw_text: string): GateResult {
   );
   const hasNums = hasAnyObjectiveNumber(raw);
 
-  // (1) ASSERTIVA SEM DADOS / SITUAÇÃO CRÍTICA (Regra de Ouro)
-  // Se declarou gravidade extrema ou intervenção forte sem números, esse é o motivo principal (uncertainty)
-  const critical = hasKeyword(raw, /\b(cr[íi]tico|muito mal|situa[çc][ãa]o\s+grave|emerg[êe]ncia|choque|sepse|urgente|mal)\b/);
-  if ((assertive || critical) && !hasNums) {
-    return { runTeacher: true, reason: "uncertainty" };
-  }
-
-  // (2) HARD RISK ABSOLUTO: SpO2 < 92
+  // (1) HARD RISK ABSOLUTO: SpO2 < 92 (Prioridade Máxima)
   const spo2Vital =
     student_facts?.vitals?.spo2_initial ?? student_facts?.vitals?.spo2;
   if (Number.isFinite(spo2Vital) && spo2Vital < 92) {
     return { runTeacher: true, reason: "hard_risk_spo2_lt_92" };
   }
 
-  // (3) HARD RISK: Alteração neurológica
+  // (2) HARD RISK: Alteração neurológica
   const neuroStudent = student_facts?.physical_exam?.neuro;
   const neuroText = hasKeyword(
     raw,
-    /\b(confus[ao]|desorientad[oa]|agita(d[oa]|cao)|rebaixamento|sonolent[oa])\b/,
+    /\b(confus[ao]|desorientad[oa]|rebaixamento|sonolent[oa])\b/, // removido agitado/agitacao conforme solicitado
   );
   if (neuroStudent || neuroText) {
     return { runTeacher: true, reason: "hard_risk_neuro_change" };
+  }
+
+  // (3) ASSERTIVA SEM DADOS / SITUAÇÃO CRÍTICA (Regra de Ouro)
+  // Se declarou gravidade extrema ou intervenção forte sem números, esse é o motivo principal (uncertainty)
+  const critical = hasKeyword(raw, /\b(cr[íi]tico|muito mal|situa[çc][ãa]o\s+grave|emerg[êe]ncia|choque|sepse|urgente|mal)\b/);
+  if ((assertive || critical) && !hasNums) {
+    return { runTeacher: true, reason: "uncertainty" };
   }
 
   // (4) DOCUMENTATION RISK

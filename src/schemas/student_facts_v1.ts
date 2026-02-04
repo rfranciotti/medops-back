@@ -74,7 +74,7 @@ export const StudentFactsV1 = z.object({
     .array(
       z.object({
         test: z.string(),
-        result: z.string(),
+        result: z.coerce.string(),
         status: z.enum(["done", "pending", "not_done"]).optional(),
       }),
     )
