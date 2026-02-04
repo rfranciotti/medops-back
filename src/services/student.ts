@@ -57,6 +57,8 @@ Patient data extraction rules:
 Vitals Extraction (STRICT - REQUIRED: Use ONLY null or numeric values):
 - vitals.spo2_initial:
   Prefer SpO2 explicitly on room air ("ar ambiente"). If none, use the first SpO2 mentioned.
+  Synonyms for SpO2: "Sat", "SatO2", "Saturação", "Saturando". 
+  Ex: "Sat 90%" -> 90. "Saturação 88" -> 88.
 - vitals.spo2_on_o2:
   SpO2 explicitly mentioned AFTER oxygen therapy or while on oxygen.
 - vitals.hr: heart rate as number ONLY. Use null if not a digit.

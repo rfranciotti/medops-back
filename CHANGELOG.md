@@ -1,5 +1,74 @@
 # CHANGELOG - MedOps Back-End
 
+## [v2.1.0] - 2026-02-04 - "Information Integrity Fix"
+
+### 🎯 **Objetivo da Release:**
+Corrigir a perda de informações explícitas no summary, garantindo que TODOS os exames, condutas e contexto operacional presentes no texto original sejam refletidos no JSON final, sem filtros agressivos.
+
+---
+
+### ✨ **Novas Funcionalidades:**
+
+#### 1. **Zero Information Loss (Exames)**
+- Extração de **TODOS** os exames mencionados no texto e no `student_facts`.
+- Regex de extração expandido (21+ patterns) para cobrir hemograma, eletrólitos, função renal, etc.
+- Deduplicação semântica inteligente:
+  - Remove "PCR respiratório" se "PCR respiratório completo" existe.
+  - Remove "TC de tórax" se "TC de tórax com contraste" existe.
+
+#### 2. **Contexto Operacional Preservado**
+- Novo campo `analysis.operational_notes[]` no JSON.
+- Captura citações de contexto:
+  - "Sem tempo para muita anamnese"
+  - "História bem típica, sem muita dificuldade diagnóstica"
+  - Estado geral do paciente ("regular/bom/mau")
+
+#### 3. **Separação de Condutas (Iniciadas vs Planejadas)**
+- JSON agora retorna:
+  - `initiated_interventions`: O que REALMENTE aconteceu (O2, acesso, monitorização).
+  - `planned_interventions`: O que é condicional ("Analgesia se necessário").
+- Evita que planos condicionais pareçam condutas já realizadas.
+
+#### 4. **Limpeza de Redundâncias**
+- "Antibioticoterapia" (genérico) é removido automaticamente se antibióticos específicos (ceftriaxona, azitromicina) já estiverem listados.
+- "Acompanhamento médico" substituído por termos mais precisos ("Monitorização no PS", "Sob avaliação médica").
+
+---
+
+### 🐛 **Correções de Bugs:**
+
+#### 1. **Summary "Míope"** (CRÍTICO)
+**Problema:** Summary descartava hemograma, função renal e outros exames básicos, focando só em "achados anormais".
+
+**Solução:** Pipeline `enrichRequestedExams` agora aceita TODOS os inputs do Student e do Regex, garantindo fidelidade total ao pedido médico.
+
+#### 2. **Analgesia Condicional como Iniciada**
+**Problema:** "Analgesia se necessário" aparecia como "Analgesia" na lista de iniciadas.
+
+**Solução:** Regex aprimorado para detectar condições e mover para `planned_interventions`.
+
+#### 3. **Citações Truncadas**
+**Problema:** "História bem típica" aparecia cortado.
+
+**Solução:** Regex de captura expandido para pegar a frase completa até a pontuação.
+
+---
+
+### 📊 **Estrutura de Dados (New Fields):**
+
+#### **Novo campo `analysis`:**
+```json
+"analysis": {
+  "initiated_interventions": [...], // NOVO: Condutas reais
+  "planned_interventions": [...],   // NOVO: Condicionais (se necessário)
+  "operational_notes": [...],       // NOVO: Contexto e citações
+  "requested_exams": [...],         // EXPANDIDO: Lista completa de exames
+  // ... campos anteriores mantidos
+}
+```
+
+---
+
 ## [v2.0.0] - 2026-02-03 - "Clean Output"
 
 ### 🎯 **Objetivo da Release:**

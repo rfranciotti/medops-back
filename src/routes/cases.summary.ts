@@ -213,10 +213,11 @@ export const casesSummaryRoute: FastifyPluginAsync = async (app) => {
     if (!c)
       return reply.code(404).send({ ok: false, message: "Case not found." });
 
+    const text = (c.raw_text || "").toLowerCase();
     const sf = c.student_facts;
     const teacher = c.teacher_output;
     const sections = teacher?.sections || [];
-    const paMatches = (c.raw_text || "").match(/\b(\d{2,3})[x\/](\d{2,3})\b/g);
+    const paMatches = text.match(/\b(\d{2,3})[x\/](\d{2,3})\b/g);
 
     // 1. Coleta e Limpeza de Incertezas
     const rawUncertainties: string[] = [];
@@ -227,7 +228,7 @@ export const casesSummaryRoute: FastifyPluginAsync = async (app) => {
     if (paMatches && paMatches.length > 1)
       rawUncertainties.push(`⚠️ CONFLITO DE PA: ${paMatches.join(", ")}`);
 
-    const rawLowerText = (c.raw_text || "").toLowerCase();
+    const rawLowerText = text;
     if (rawLowerText.includes("hipertenso?") || rawLowerText.includes("hipertenso ?")) {
       rawUncertainties.push(`Hipertensão incerta: "Hipertenso?" (texto contém '?')`);
     }
@@ -345,13 +346,274 @@ export const casesSummaryRoute: FastifyPluginAsync = async (app) => {
     });
 
     // 4. Renderização de Achados (Regra de Ouro)
+    // --- SEÇÃO 4: DETERMINISTIC MERGE (CORE FIX) ---
+
+    // 4.1. Antecedentes (Fonte: Student Facts + Negativos Determinísticos)
+    const enrichHistory = (): string[] => {
+       const history: string[] = [];
+       const rawLow = text; // já é c.raw_text.toLowerCase()
+
+       // A. Comorbidades e Histórico (Student Facts)
+       const comorb = sf?.comorbidities || [];
+       const pmh = sf?.past_medical_history || [];
+       const combined = uniqClean([...comorb, ...pmh]).filter(h => {
+          const hLow = h.toLowerCase();
+          return !finalUncertainties.some(u => u.toLowerCase().includes(hLow));
+       });
+
+       if (combined.length > 0) {
+          history.push(`Comorbidades: ${combined.join(", ")}`);
+       }
+
+       // B. Tabagismo
+       if (rawLow.includes("ex-tabagista") || rawLow.includes("extabagista")) {
+          history.push("Tabagismo: ex-tabagista");
+       } else if (rawLow.includes("tabagista") || rawLow.includes("fumante")) {
+          history.push("Tabagismo: ativo");
+       } else if (rawLow.includes("nega tabagismo") || rawLow.includes("não fuma") || rawLow.includes("não é fumante")) {
+          history.push("Tabagismo: negado");
+       }
+
+       // C. Alergias e Cirurgias (Negativos e Positivos Fatuais)
+       if (rawLow.includes("nega alergia") || rawLow.includes("sem alergia") || rawLow.includes("alergias: nega") || rawLow.includes("nega alergias")) {
+          history.push("Alergias: negadas");
+       } else {
+          const allerg = (sf?.medications || []).filter((m: any) => String(m?.name || m).toLowerCase().includes("alergia"));
+          if (allerg.length > 0) history.push(`Alergias: ${allerg.map((a: any) => toStr(a?.name || a)).join(", ")}`);
+       }
+
+       if (rawLow.includes("nega cirurgia") || rawLow.includes("sem cirurgia") || rawLow.includes("sem cirurgias importantes") || rawLow.includes("nega cirurgias")) {
+          history.push("Cirurgias prévias: negadas");
+       }
+
+       // D. Medicações Habituais
+       if (rawLow.includes("medicações habituais") || rawLow.includes("remedios habituais") || rawLow.includes("medicações de uso contínuo") || rawLow.includes("uso de medicação habitual")) {
+          const medsMatch = (c.raw_text || "").match(/(uso de medicações habituais[^.]*|medicações habituais[^.]*|remédios habituais[^.]*|medicações de uso contínuo[^.]*|uso de medicação habitual[^.]*)/i);
+          if (medsMatch) history.push(`Medicações habituais: ${medsMatch[0].trim()}`);
+          else history.push("Medicações habituais: em uso (conforme relato)");
+       }
+
+       return history;
+    };
+
+    // 4.2. Conduta / Plano (Fonte: Student Facts + Texto Determinístico)
+    // Retorna: { initiated: string[], planned: string[] }
+    const enrichPlan = (): { initiated: string[], planned: string[] } => {
+       const initiated: string[] = [];
+       const planned: string[] = [];
+       const rawLow = text;
+       const rawOriginal = c.raw_text || "";
+
+       // A. Oxigenioterapia
+       const ot = sf?.oxygen_therapy;
+       if (rawLow.includes("o2") || rawLow.includes("oxigênio") || rawLow.includes("oxigenio") || ot?.device || ot?.flow_l_min) {
+          const device = toStr(ot?.device);
+          const flow = ot?.flow_l_min ? `${ot.flow_l_min}L/min` : "";
+          const combined = `${device}${device && flow ? " " : ""}${flow}`.trim();
+          if (combined && combined !== "null" && combined !== "") {
+             initiated.push(`Oxigenioterapia: ${combined}`);
+          } else if (rawLow.includes("o2") || rawLow.includes("oxigenio")) {
+             initiated.push("Oxigenioterapia iniciada/mantida");
+          }
+       }
+
+       // B. Condutas Determinísticas (verificar se é condicional com contexto amplo)
+       const conds = [
+          { name: "Hidratação EV", key: "hidratacao", regex: /\bhidrata[çc][ãa]o\s+ev\b|\bsoro\b|\bfluido\b/i },
+          { name: "Analgesia", key: "analgesia", regex: /\banalgesia\b|\bdipirona\b|\btramal\b|\bmorfina\b/i },
+       ];
+
+       conds.forEach(cnd => {
+          if (cnd.regex.test(rawLow)) {
+             // Extract sentence context to check for "se necessário"
+             const sentenceMatch = rawOriginal.match(new RegExp(`[^.]*${cnd.key}[^.]*`, 'i'));
+             // Check if conditional (fixed regex: necess[aá]rio instead of nece[scs][sá]rio)
+             const isConditional = sentenceMatch && /se\s+necess[aá]rio/i.test(sentenceMatch[0]);
+             
+             if (isConditional) {
+                planned.push(`${cnd.name} (se necessário)`);
+             } else {
+                initiated.push(cnd.name);
+             }
+          }
+       });
+
+       // C. Antibioticoterapia - APENAS se não houver antibióticos específicos listados
+       const hasAntibiotics = /\b(ceftriaxona|azitromicina|sulfametoxazol|trimetoprima|penicilina|amoxicilina)\b/i.test(rawLow);
+       const mentionsGenericATB = /\bantibiotico\b|\bantibiótico\b|\batb\b/i.test(rawLow);
+       
+       // D. Medicações ativas (Student Facts) - primeiro para saber se há antibióticos
+       const activeMeds = (sf?.medications || []).map((m: any) => toStr(m?.name || m)).filter(Boolean);
+       const hasSpecificAntibiotics = activeMeds.some((m: string) => /ceftriaxona|azitromicina|sulfametoxazol|trimetoprima|penicilina|amoxicilina/i.test(m));
+
+       // Se menciona antibiótico genérico MAS não tem específicos, adiciona genérico
+       if (mentionsGenericATB && !hasAntibiotics && !hasSpecificAntibiotics) {
+          initiated.push("Antibioticoterapia");
+       }
+
+       // E. Monitorização e Acompanhamento (termos específicos documentados)
+       if (rawLow.includes("manter monitorização") || rawLow.includes("monitorização no ps")) {
+          initiated.push("Monitorização no PS");
+       } else if (rawLow.includes("monitoriz") || rawLow.includes("monitoria") || rawLow.includes("monitor")) {
+          initiated.push("Monitorização contínua");
+       }
+
+       if (rawLow.includes("segue sob minha avaliação") || rawLow.includes("sob avaliação")) {
+          initiated.push("Sob avaliação médica");
+       } else if (rawLow.includes("segue em observação") || rawLow.includes("segue comigo")) {
+          initiated.push("Em observação médica");
+       }
+
+       // F. Medicações específicas (Student Facts)
+       activeMeds.forEach((m: string) => {
+          const mLow = m.toLowerCase();
+          if (/(has|dm|alergia|hipertens|diabet)/i.test(mLow)) return;
+          if (!initiated.some(p => p.toLowerCase().includes(mLow))) initiated.push(`Medicação: ${m}`);
+       });
+
+       return { 
+          initiated: uniqClean(initiated), 
+          planned: uniqClean(planned) 
+       };
+    };
+
+    // 4.3. Exames Solicitados (Fonte: Student Facts + Texto - SEM FILTRO)
+    const enrichRequestedExams = (): string[] => {
+       const rawLow = text;
+       const exams: string[] = [];
+
+       // EXPANDED: Add ALL common lab and imaging tests
+       const cfg = [
+          // Imaging
+          { name: "RX de tórax", regex: /\b(rx|raio-?x)\s+(de\s+)?t[óo]rax\b/i },
+          { name: "TC de tórax", regex: /\b(tc|tomografia)\s+(de\s+)?t[óo]rax\b/i },
+          { name: "ECG", regex: /\becg\b|\beletrocardiograma\b/i },
+          { name: "Ecocardiograma", regex: /\becocardiograma\b|\beco\s+cardio\b/i },
+          { name: "Doppler de MMII", regex: /\bdoppler(\s+de)?\s+mmii\b/i },
+          
+          // Lab tests - Blood
+          { name: "Hemograma", regex: /\bhemograma\b/i },
+          { name: "Eletrólitos", regex: /\beletr[óo]litos?\b/i },
+          { name: "Função renal", regex: /\bfun[çc][ãa]o\s+renal\b|\bcreatinina\b|\bur[ée]ia\b/i },
+          { name: "TGO/TGP", regex: /\btgo\b|\btgp\b|\btransaminases?\b/i },
+          { name: "PCR", regex: /\bpcr\b(?!\s+respirat)/i }, // PCR lab, not respiratory PCR
+          { name: "Procalcitonina", regex: /\bprocalcitonina\b/i },
+          { name: "D-dímero", regex: /\bd-?d[íi]mero\b/i },
+          { name: "Troponina", regex: /\btroponina(\s+seriada)?\b/i },
+          { name: "Gasometria arterial", regex: /\bgasometria(\s+arterial)?\b/i },
+          { name: "Coagulograma", regex: /\bcoagulograma\b/i },
+          { name: "Lactato", regex: /\blactato\b/i },
+          { name: "BNP", regex: /\bbnp\b/i },
+          { name: "Hemoculturas", regex: /\bhemoculturas?\b/i },
+          
+          // Urine
+          { name: "Urina tipo I", regex: /\burina\s+tipo\s+i\b|\beas\b|\burin[aá]lise\b/i },
+          
+          // Viral/Respiratory
+          { name: "Sorologias virais", regex: /\bsorologias?\s+virais?\b/i },
+          { name: "PCR respiratório", regex: /\bpcr\s+respirat[óo]rio\b/i },
+       ];
+
+       const isRequested = /\b(solicitei|pedi|pedido|solicitado|aguardando|aguardo|aguardamos|protocolo)\b/i.test(rawLow);
+
+       // Extract from text using patterns
+       if (isRequested) {
+          cfg.forEach(ex => {
+             if (ex.regex.test(rawLow)) exams.push(ex.name);
+          });
+       }
+
+       // CRITICAL: Extract ALL from student_facts.exams and pending_exams (NO FILTER)
+       const sfExams = (sf?.pending_exams || []).concat((sf?.exams || []).map((e: any) => toStr(e?.name || e)));
+       uniqClean(sfExams).forEach((e: string) => {
+          if (!exams.some(ex => ex.toLowerCase() === e.toLowerCase())) exams.push(e);
+       });
+
+       // CRITICAL: Extract ALL from student_facts.lab_results (NO FILTER)
+       const labResults = sf?.lab_results || [];
+       labResults.forEach((lab: any) => {
+          const testName = toStr(lab?.test || lab?.name);
+          if (testName && !exams.some(ex => ex.toLowerCase() === testName.toLowerCase())) {
+             exams.push(testName);
+          }
+       });
+
+       // SEMANTIC DEDUPLICATION: Prefer more specific exam names
+       const normalized = uniqClean(exams);
+       const deduped: string[] = [];
+       
+       // Rules: Keep the most specific version
+       const dedupRules = [
+          { generic: /^tc de t[óo]rax$/i, specific: /tc de t[óo]rax com contraste/i },
+          { generic: /^pcr respirat[óo]rio$/i, specific: /pcr respirat[óo]rio completo/i },
+          { generic: /^troponina$/i, specific: /troponina seriada/i },
+          { generic: /^gasometria$/i, specific: /gasometria arterial/i },
+       ];
+
+       normalized.forEach(exam => {
+          const examLow = exam.toLowerCase();
+          let skip = false;
+
+          // Check if this is a generic version and a specific version exists
+          for (const rule of dedupRules) {
+             if (rule.generic.test(examLow)) {
+                // Check if we have the specific version
+                if (normalized.some(e => rule.specific.test(e.toLowerCase()))) {
+                  skip = true; // Skip the generic, keep the specific
+                  break;
+                }
+             }
+          }
+
+          if (!skip) deduped.push(exam);
+       });
+
+       return deduped;
+    };
+
+    // 4.4. Contexto Operacional / Documental (Fonte: Texto Explícito)
+    const enrichOperationalContext = (): string[] => {
+       const context: string[] = [];
+       const rawLow = text;
+
+       // A. Limitações documentais explícitas
+       if (rawLow.includes("sem tempo para") && rawLow.includes("anamnese")) {
+          const match = (c.raw_text || "").match(/(sem tempo para [^.]+)/i);
+          if (match) context.push(`⚠️ ${match[0].trim()}`);
+       }
+
+       // B. Estado geral do paciente
+       if (rawLow.includes("regular estado geral")) {
+          context.push("Estado geral: regular");
+       } else if (rawLow.includes("bom estado geral")) {
+          context.push("Estado geral: bom");
+       } else if (rawLow.includes("mau estado geral") || rawLow.includes("mal estado geral")) {
+          context.push("Estado geral: mau");
+       }
+
+       // C. Outras observações operacionais (citações do médico, não avaliação do sistema)
+       // FIX: Extrair citação COMPLETA sem truncamento
+       if (rawLow.includes("quadro evidente") || rawLow.includes("quadro bem típico") || rawLow.includes("sem muita dificuldade diagnóstica")) {
+          // Extract complete sentence (até o próximo ponto)
+          const completeMatch = (c.raw_text || "").match(/(História bem típica[^.]+diagnóstica|sem muita dificuldade diagnóstica|quadro [ée] evidente)/i);
+          if (completeMatch) {
+             context.push(`Observação do médico: "${completeMatch[0].trim()}"`);
+          }
+       }
+
+       if (rawLow.includes("aguardando exames") || rawLow.includes("aguardo") && rawLow.includes("resultado")) {
+          context.push("Status: aguardando resultados de exames");
+       }
+
+       return context;
+    };
+
+    // 4.5. Resumo dos Achados (Fonte: Teacher Output + Student Facts Acute)
     const enrichFindings = (findings: string[]): string[] => {
       const enriched: string[] = [];
-      const symptomaticLines: string[] = [];
-      const rawText = c.raw_text || "";
-      const rawLow = rawText.toLowerCase();
+      const rawLow = text;
 
-      // A. Cabeçalho Paciente (Peso/Altura)
+      // A. Dados Físicos (Student Facts)
       const p = sf?.patient;
       if (p?.weight_kg || p?.height_m) {
         let line = "Dados físicos: ";
@@ -364,220 +626,96 @@ export const casesSummaryRoute: FastifyPluginAsync = async (app) => {
       if (sf?.presenting_problem?.chief_complaint) {
         let qp = `Queixa principal: ${sf.presenting_problem.chief_complaint}`;
         if (sf.presenting_problem.onset) qp += ` (início: ${sf.presenting_problem.onset})`;
-        else if (sf.presenting_problem.duration) {
-          let dur = String(sf.presenting_problem.duration).trim();
-          if (/^\d+$/.test(dur)) dur += " dias";
-          if (!dur.startsWith("há")) dur = `há ${dur}`;
-          qp += ` (${dur})`;
-        }
+        else if (sf.presenting_problem.duration) qp += ` (${sf.presenting_problem.duration})`;
         enriched.push(qp);
       }
 
-      // C. Declarações Factuais (Mão de Ferro)
-      if (rawLow.includes("sepse")) {
-        enriched.push("Suspeita declarada: sepse grave");
-      }
-
-      // Antibióticos (Factual)
-      const antibiotics: string[] = [];
-      if (rawLow.includes("ceftriaxona")) antibiotics.push("Ceftriaxona");
-      if (rawLow.includes("azitromicina")) antibiotics.push("Azitromicina");
-      
-      if (antibiotics.length > 0) {
-        enriched.push(`Antibiótico: ${antibiotics.join(" e ")}`);
-      } else if (rawLow.includes("antibi")) {
-        enriched.push("Antibiótico iniciado (relato do médico)");
-      }
-
-      if (rawLow.includes("saturação ruim") || (rawLow.includes("sat") && rawLow.includes("ruim"))) {
-        enriched.push("Saturação declarada como ruim");
-      }
-      if (rawLow.includes("pressão caiu") || rawLow.includes("pa caiu") || rawLow.includes("hipotens")) {
-        enriched.push("Relato de queda pressórica");
-      }
-      if (rawLow.includes("situação crítica") || rawLow.includes("estado crítico")) {
-        enriched.push("Estado clínico declarado: crítico");
-      }
-      if (rawLow.includes("suando frio") || rawLow.includes("sudorese")) {
-        enriched.push("Relato de sudorese/suando frio");
-      }
-      if (rawLow.includes("exame físico normal") || rawLow.includes("exame fisico normal")) {
-        enriched.push("Exame físico normal");
-      }
-      if (rawLow.includes("saturando bem")) {
-        enriched.push("Saturando bem");
-      }
-
-      // D. Vitais e Oxigênio (Consolidado com Incerteza)
-      const hasInitialSpO2 = Number.isFinite(sf?.vitals?.spo2_initial);
-      const hasO2SpO2 = Number.isFinite(sf?.vitals?.spo2_on_o2);
-      const ot = sf?.oxygen_therapy;
-
-      // Helper para detectar faixas no texto (ex: 91-92, 2 ou 3)
-      const findRange = (num: number, contextSuffix: string): string => {
-        const pattern = new RegExp(`(${num})\\s*([\\-–/]|ou)\\s*(\\d+)`, "i");
-        const m = rawText.match(pattern);
-        if (m) return `${m[1]}-${m[3]}${contextSuffix}`;
-        return `${num}${contextSuffix}`;
-      };
-
-      if (hasInitialSpO2) {
-        let satLine = `SpO₂ inicial: ${sf.vitals.spo2_initial}% em ar ambiente`;
-        if (hasO2SpO2) {
-          const hasOT = ot?.device || ot?.flow_l_min;
-          const satOnO2Value = findRange(sf.vitals.spo2_on_o2, "%");
-          if (hasOT) {
-            const flow = ot?.flow_l_min ? ` ${findRange(ot.flow_l_min, "L/min")}` : "";
-            const device = ot?.device ? ` ${ot.device}` : "";
-            satLine += ` → ${satOnO2Value} sob O₂${device}${flow}`;
-          } else {
-            satLine += ` → ${satOnO2Value}`;
-          }
-        }
-        enriched.push(satLine.trim());
-      }
-
-      // Linha de administração de O2
-      if (rawLow.includes("melhorou") || rawLow.includes("saturou melhor")) {
-        enriched.push("Oxigênio administrado com melhora clínica referida");
-      } else {
-        const device = toStr(ot?.device);
-        const flow = ot?.flow_l_min ? `${findRange(ot.flow_l_min, "L/min")}` : "";
-        if (device || flow) {
-          const combined = `${device}${device && flow ? " " : ""}${flow}`.trim();
-          // Anti-tautologia: se device/flow apenas diz "oxigênio"
-          if (combined.toLowerCase() === "oxigênio" || combined.toLowerCase() === "oxigenio") {
-            enriched.push("Oxigênio");
-          } else {
-            enriched.push(`Oxigênio: ${combined}`);
-          }
-        } else if (rawLow.includes("o2") && !hasInitialSpO2) {
-          enriched.push("Oxigênio");
+      // B.1. Sintomas Adicionais (Student Facts - additional_symptoms)
+      const additionalSymptoms = sf?.presenting_problem?.additional_symptoms || [];
+      if (additionalSymptoms.length > 0) {
+        const symptomsClean = uniqClean(additionalSymptoms.map(toStr).filter(Boolean));
+        if (symptomsClean.length > 0) {
+          enriched.push(`Sintomas associados: ${symptomsClean.join(", ")}`);
         }
       }
 
-      if (Number.isFinite(sf?.vitals?.temp)) enriched.push(`Temperatura: ${sf.vitals.temp}ºC`);
-
-      // C. Exame Físico Objetivo
-      const respRegex = /\b(roncos|estertores|murm[uú]rio|crepita|sibilo|sibilante|fricção|respira|pulm[oã]o|bases?|ápices?)\b/i;
-      const auscultaRaw = [
-        ...(sf?.physical_exam?.findings || []),
-        ...(sf?.presenting_problem?.additional_symptoms || []).filter((s: string) => respRegex.test(s.toLowerCase()))
-      ];
-      const vagueRegex = /(normal|bom|boa|ruim|estranho|alterado|ok|talvez|parece|prov[áa]vel|meio|est[áa]vel|grave|sepse|choque|mal|morrer)/i;
+      // C. Fatos Clínicos Agudos
+      if (rawLow.includes("sepse")) enriched.push("Suspeita declarada: sepse");
+      if (rawLow.includes("nega dor torácica")) enriched.push("Nega dor torácica");
+      if (rawLow.includes("consciente") && rawLow.includes("orientado")) enriched.push("Consciente e orientado");
+      if (rawLow.includes("lúcido")) enriched.push("Lúcido");
       
-      const auscultaFiltered = auscultaRaw.filter((f: string) => {
-         const fLow = f.toLowerCase();
-         return respRegex.test(fLow) && !vagueRegex.test(fLow);
-      });
+      // C.1. Estado do Paciente (dispneico, etc)
+      if (rawLow.includes("dispneico") || rawLow.includes("dispnéico")) enriched.push("Paciente dispneico");
 
-      if (auscultaFiltered.length > 0)
-        enriched.push(`Ausculta pulmonar: ${auscultaFiltered.join(", ")}`);
+      // D. Vitais Numéricos
+      const v = sf?.vitals;
+      if (v?.spo2_initial) enriched.push(`SpO₂ inicial: ${v.spo2_initial}% em AA`);
+      if (v?.spo2_on_o2) enriched.push(`SpO₂ sob oxigênio: ${v.spo2_on_o2}%`);
+      if (v?.temp) enriched.push(`Temperatura: ${v.temp}ºC`);
 
-      if (sf?.physical_exam?.neuro) {
-        const cleanNeuro = sf.physical_exam.neuro.replace(/^alteração\s+do\s+estado\s+mental\s*\/\s*/i, "").trim();
-        if (cleanNeuro) enriched.push(`Estado mental: ${cleanNeuro}`);
-      }
-
-      // EXAMES REALIZADOS (Extração Factual)
-      if (rawLow.includes("tgo e tgp normais")) {
-        enriched.push("TGO: normal");
-        enriched.push("TGP: normal");
-      }
-
-      // D. Sintomas Associados (Aggregated & Filtered)
-      const symptoms = (sf?.presenting_problem?.additional_symptoms || [])
-        .filter((s: string) => {
-           const sLow = s.toLowerCase().trim().replace(/[^a-z0-9]/g, "");
-           const qpRaw = (sf?.presenting_problem?.chief_complaint || "").toLowerCase().trim();
-           const qpLow = qpRaw.replace(/[^a-z0-9]/g, "");
-           
-           // Bloqueia duplicata da Queixa Principal (limpeza agressiva)
-           if (sLow === qpLow || qpLow.includes(sLow) || sLow.includes(qpLow)) return false;
-           
-           // Bloqueia se for achado pulmonar (já foi para Ausculta)
-           if (respRegex.test(s.toLowerCase())) return false;
-
-           // Bloqueia se for vago (deveria estar em incertezas)
-           if (/(normal|bom|boa|ruim|estranho|alterado|ok|talvez|parece|prov[áa]vel|meio|est[áa]vel|grave|sepse|choque|mal|morrer)/i.test(sLow) && !/\d/.test(sLow)) return false;
-           
-           // Bloqueia se já está nas incertezas
-           if (finalUncertainties.some(u => u.toLowerCase().replace(/[^a-z0-9]/g, "").includes(sLow))) return false;
-           
-           return true;
-        });
-
-      if (symptoms.length > 0) {
-        const symptomsLine = `Sintomas associados: ${symptoms.join(", ")}`;
-        enriched.push(symptomsLine);
-        symptomaticLines.push(...symptoms.map((s: string) => s.toLowerCase().trim()));
-      }
-
-      // E. Comorbidades (Apenas objetivas)
-      const comorb = sf?.comorbidities || [];
-      if (evidence_quality.history === "objective") {
-        const validComorb = comorb.filter((com: string) => {
-          const comLow = com.toLowerCase();
-          if ((comLow.includes("hiperten") || comLow.includes("has")) && (rawLow.includes("hipertenso?") || rawLow.includes("hipertenso ?"))) return false;
-          return !finalUncertainties.some((u: string) => u.toLowerCase().includes(comLow));
-        });
-        if (validComorb.length > 0)
-          enriched.push(`Comorbidades autorreferidas: ${validComorb.join(", ")}`);
-      }
-
-      // F. Filtro de Findings (Regra de Ouro - POSITIVE OBSERVABLES ONLY)
-      findings.forEach((f: string) => {
-        const fLow = f.toLowerCase().trim();
-
-        // 1. Dedupe Semântico de Sintomas (Regra final 1)
-        if (symptomaticLines.some((s: string) => fLow === s || fLow.includes(s))) return;
-
-        // 2. Bloqueios de Ausência / Falta / Subjectividade / Placeholders (NÃO é achado observável positivo)
-        if (/(temperatura|press[ãa]o|bp|pa|sist[óo]lica|diast[óo]lica|frequ[êe]ncia|spo2|satura[çc][ãa]o|oxig[êe]nio)/i.test(fLow) && !/\d/.test(fLow)) return;
-        if (/n[ãa]o\s+(registrad[oa]|documentad[oa]|aferid[oa]|informad[oa]|relatad[oa])/i.test(fLow)) return;
-        if (/(inalterad[oa]|est[aacute]vel|sem\s+particularidades|nada\s+digno|unremarkable|normal|bom|boa|ruim|estranho|alterado|ok|talvez|parece|prov[áa]vel|meio|grave|cr[íi]tico|urgente|sepse|choque|mal|morrer)/i.test(fLow)) return;
-        if (/missing|not\s+documented|unknown|vitals\s+not|exames\s+mencionados|medica[çc][õo]es\s+mencionadas/i.test(fLow)) return;
-        // Anti-interpretação
-        if (fLow.includes("desconforto respirat") && !c.raw_text?.toLowerCase().includes("desconforto respirat")) return;
-
-        // 3. Bloqueios de Qualidade (Incertezas) - REGRA ABSOLUTA PARA MEDICAÇÃO
-        if (evidence_quality.antibiotic !== "objective" || evidence_quality.medications !== "objective") {
-          if (/antibi[óo]tico|atb|ceftriaxona|piperacilina|azitro|remedio|medica/i.test(fLow)) return;
+      // E. Exame Físico Objetivo (Student Facts - ALL findings)
+      const allPhysicalFindings = sf?.physical_exam?.findings || [];
+      allPhysicalFindings.forEach((finding: any) => {
+        const findingStr = toStr(finding);
+        if (!findingStr) return;
+        const fLow = findingStr.toLowerCase();
+        
+        // Skip vitals that are already shown in dedicated vitals section
+        if (/(sat|spo2|fc|pa|temp)\s+\d/i.test(fLow)) return;
+        
+        // Ausculta findings
+        if (/\b(estertor|ronco|murm|sibilo|respirat|pulm[oã]o)\b/i.test(fLow)) {
+          if (!enriched.some(e => e.toLowerCase().includes(findingStr.toLowerCase()))) {
+            enriched.push(`Ausculta: ${findingStr}`);
+          }
+          return;
         }
         
-        if (evidence_quality.bp !== "objective" && /pa[:\s]|press[atilde]o|13\s+por\s+8/i.test(fLow)) return;
-        if (evidence_quality.history !== "objective" && /hist[óo]rico|bronquite|enfisema/i.test(fLow)) return;
+        // Other physical exam findings
+        if (!enriched.some(e => e.toLowerCase().includes(findingStr.toLowerCase()))) {
+          enriched.push(`Exame físico: ${findingStr}`);
+        }
+      });
+      
+      // E.1. Abdome e Extremidades (explicit text extraction)
+      if (rawLow.includes("abdome") && (rawLow.includes("sem alterações") || rawLow.includes("sem alteracao"))) {
+        if (!enriched.some(e => e.toLowerCase().includes("abdome"))) {
+          enriched.push("Abdome: sem alterações");
+        }
+      }
+      
+      if (rawLow.includes("extremidades perfundidas")) {
+        if (!enriched.some(e => e.toLowerCase().includes("extremidades"))) {
+          enriched.push("Extremidades: perfundidas");
+        }
+      }
 
-        // 4. Bloqueios de Processo / Log Operacional
-        if (/soro|fluido|iv\s+access|acesso\s+venoso|gotejamento|hidrata[çc][ãa]o/i.test(fLow)) return;
-        if (/colhido|pedido|aguardando|solicitado|pendente|realizado/i.test(fLow)) return;
-        if (/raio-x|rx|t[óo]rax|sangue|laborat|tc|tomografia|rm|resson[âa]ncia|gasometria|pcr|procalcitonina|d-d[íi]mero|troponina|bnp|eco|ecocardiograma|cultura|bi[óo]psia/i.test(fLow)) return;
+      if (sf?.physical_exam?.neuro) enriched.push(`Neurológico: ${sf.physical_exam.neuro}`);
 
-        // 5. Bloqueios de Redundância e Comorbidades
-        if (/sat|spo2|satura[çc][atilde]o|fc[:\s]|cardiaca/i.test(fLow)) return;
-        if (/o2|oxig[êe]nio|cateter|fluxo/i.test(fLow)) return;
-        if (respRegex.test(fLow)) return;
-        if (/neuro|confuso|orientado|mental/i.test(fLow)) return;
-        if (/hipertenso|diabetes|has|dm|bronquite|enfisema|problema\s+no\s+pulm[oã]o/i.test(fLow)) return;
-        if (sf?.presenting_problem?.chief_complaint && fLow.includes(sf.presenting_problem.chief_complaint.toLowerCase())) return;
-
-        // 6. Regra Final de Observabilidade: deve descrever algo positivo/físico
-        if (f.length > 3) enriched.push(f);
+      // F. Filtro de Auditoria (Teacher Output)
+      findings.forEach((f: string) => {
+        const fLow = f.toLowerCase();
+        
+        // REGRA DE OURO: Bloqueia o que já está categorizado
+        if (/(hipertens|diabet|has|dm|tabag|alergia|cirurg|habitu|uso cont[ií]nuo)/i.test(fLow)) return; 
+        if (/(oxig[êe]nio|o2|soro|fluido|hidrata[çc][ãa]o|analgesi|atb|antibiotico|monitor)/i.test(fLow)) return; 
+        if (/(rx|raio|tc|tomograf|ecg|eletro|exame|laborat|sangue|colhido|pedido|aguardando)/i.test(fLow)) return; 
+        if (/(temp|press[atilde]o|pa|spo2|sat)/i.test(fLow)) return; 
+        if (/(normal|bom|boa|ruim|ok|est[aacute]vel|sem\s+particularidades)/i.test(fLow) && !/\d/.test(fLow)) return;
+        
+        enriched.push(f);
       });
 
-      return enriched;
+      return uniqClean(enriched);
     };
 
     // 5. Coleta de Pendências Canonizadas
     const pendingSet = new Set<string>();
-    
     const missingRaw = [...rawMissing];
     
-    // Varre findings E incertezas em busca de menções vagas que devem virar cobrança
     [...rawFindings, ...rawUncertainties].forEach((txt: string) => {
       const tLow = txt.toLowerCase();
-
-      // BLOCKER: Anti-regressão de vitais (Se tem número, não cobra incerteza textual)
       if (hasHR && /(fc|hr|heart|bpm|frequ[êe]ncia)/i.test(tLow)) return;
       if (hasBP && /(pa|bp|press[ãa]o|sist[óo]lica|diast[óo]lica)/i.test(tLow)) return;
       if (hasSat && /(spo2|sat|satura[çc][ãa]o)/i.test(tLow)) return;
@@ -595,86 +733,23 @@ export const casesSummaryRoute: FastifyPluginAsync = async (app) => {
 
     if (sf?.pending_exams) missingRaw.push(...sf.pending_exams);
 
-    const text = (c.raw_text || "").toLowerCase();
-
-    // PENDÊNCIAS EXPLÍCITAS (Factual)
-    if (text.includes("ainda nao fiz ecg") || text.includes("ainda não fiz ecg")) {
-      missingRaw.push("ECG não realizado (relato do médico)");
-    }
-    if (text.includes("sem gasometria")) {
-      missingRaw.push("Gasometria não realizada (relato do médico)");
-    }
-    if (text.includes("rx?") || (text.includes("raio-x") && text.includes("?"))) {
-      missingRaw.push("Confirmar RX (feito?) / resultado");
-    }
-    if (text.includes("antibiotico") && (text.includes("nao lembro") || text.includes("não lembro") || text.includes("nao sei") || text.includes("não sei"))) {
-      missingRaw.push("Nome do antibiótico (e se possível dose/horário)");
-    }
-
-    // Canonização de Gaps
-    let bpGap = false;
-    let tempGap = false;
-    let fluidGap = false;
-    let spo2Gap = false;
-    let o2Gap = false;
-    let hrGap = false;
-
-    // ✅ FIX Determinístico (Anti-Evasão): se mencionou vital no texto sem número, COBRA.
-    const mentionsSat = /\b(spo2|sat(urando|urou|uraç[ãa]o|o2)?)\b/i.test(text);
-    const hasSatNum = /\b(spo2|sat(urando|urou|uraç[ãa]o|o2)?)\b[^0-9]{0,15}(\d{2,3})\s*%?/i.test(text);
-    const benignSat = /\b(saturando\s+bem|sat\s+normal|sat\s+ok)\b/i.test(text);
-    const satUnc = finalUncertainties?.some(u => /saturação vaga|saturação contraditória|spo2 vague/i.test(String(u).toLowerCase())) ?? false;
-    
-    if (mentionsSat && !hasSatNum && !benignSat) spo2Gap = true;
-    if (satUnc) spo2Gap = true;
-
-    const mentionsFC = /\b(fc|frequ[êe]n(cia)?\s*card[ií]aca|heart\s*rate|hr|bpm)\b/i.test(text);
-    const hasFCNumber = /\b(fc|frequ[êe]n(cia)?\s*card[ií]aca|heart\s*rate|hr|bpm)\b[^0-9]{0,12}(\d{2,3})\b/i.test(text);
-    if (mentionsFC && !hasFCNumber) hrGap = true;
-
-    // ✅ FIX: Se declarar explicitamente que não anotou/anotou sinais, cobrar TUDO.
     const explicitNoVitals = /\b(n[ãa]o\s+(anotei|registrei|tenho|coloquei)|sem)\s+(sinais\s+vitais|vitais|dados)\b/i.test(text);
-
+    let bpGap = false, tempGap = false, hrGap = false, spo2Gap = false;
+    
     missingRaw.forEach(m => {
       const mLow = m.toLowerCase();
-      // Ignora generic gaps que não são fatos contextuais ou demográficos básicos
       if (/no\s+explicit|not\s+documented|timing\s+not|allergies\s+not/i.test(mLow)) return;
       if (/age|sex|dob|birth|birthdate/i.test(mLow)) return;
-      if (/radiology|labs|imaging|history|comorb/i.test(mLow) && !text.includes("exame") && !text.includes("hist[óo]r")) return;
-      if (/antibi[óo]tico|atb|exames\s+solicitados/i.test(mLow) && !text.includes("antibi") && !text.includes("exame")) return;
       
-      // SÓ gera gap se o termo foi mencionado no texto bruto (Anti-alucinação de pendência)
-      // E SE o dado numérico correspondente estiver ausente (Fix: supressão se já extraído)
-      if (/(bp|pa|sist[óo]lica|diast[óo]lica|press[ãa]o)/i.test(mLow) && /\b(pa|press[ãa]o|bp)\b/i.test(text) && !sf?.vitals?.bp_systolic) bpGap = true;
-      else if (/temp/i.test(mLow) && /\b(temp(eratura)?|febre)\b/i.test(text) && !sf?.vitals?.temp) tempGap = true;
-      else if (/(oxig[êe]nio|o2)/i.test(mLow) && /\b(o2|oxig[êe]nio|cateter|m[aacute]scara)\b/i.test(text)) o2Gap = true;
-      else if (/(soro|fluido|hidrata)/i.test(mLow) && /\b(soro|fluido|hidrata|gotejamento)\b/i.test(text)) fluidGap = true;
-      else {
-        // Se já temos a queixa principal no texto, não cobrar como pendência
-        const qp = toStr(sf?.presenting_problem?.chief_complaint).toLowerCase();
-        if (qp && mLow.includes(qp)) return;
-        if (/queixa|complaint/i.test(mLow) && qp) return;
-
-        // Se não for um gap de vital (que tem tratamento próprio abaixo), adiciona como pendência textual
-        pendingSet.add(m);
-      }
+      if (/(bp|pa|press[ãa]o)/i.test(mLow) && !sf?.vitals?.bp_systolic) bpGap = true;
+      else if (/temp/i.test(mLow) && !sf?.vitals?.temp) tempGap = true;
+      else if (/(fc|hr|heart|bpm)/i.test(mLow) && !hasHR) hrGap = true;
+      else if (/(spo2|sat)/i.test(mLow) && !hasSat) spo2Gap = true;
+      else pendingSet.add(m);
     });
-
-    if (explicitNoVitals) {
-      bpGap = true;
-      tempGap = true;
-      hrGap = true;
-      spo2Gap = true;
-      // respiratory rate gap
-    }
 
     const isBenign = /\b(exame\s+f[íi]sico\s+normal|sem\s+queixas|saturando\s+bem|est[aacute]vel|quadro\s+leve)\b/i.test(text);
     const hasGravity = /\b(sepse|choque|cr[íi]tico|grave|urgente|emerg[êe]ncia|mal|ruim|caiu|baixo|hipotens|confus[ao]|desorientad[oa]|dispneia|falta de ar|dor|suando frio|sudorese)\b/i.test(text);
-    const hasNums = /\b(\d{2,3})\s*[x\/]\s*(\d{2,3})\b/.test(text) ||
-                   /\b(spo2|sat(urando|urou|uraç[ãa]o|o2)?)\b[^0-9]{0,12}(\d{2,3})\s*%?/.test(text) ||
-                   /\b(temp(eratura)?)\b[^0-9]{0,10}(\d{2})([.,](\d))?\b/.test(text) ||
-                   /\b(fc|frequ[êe]n(cia)?\s*card[ií]aca|hr|bpm)\b[^0-9]{0,10}(\d{2,3})\b/.test(text) ||
-                   /\b(pa|press[ãa]o|bp)\b[^0-9]{0,10}(\d{2,3})\b/.test(text);
 
     let gateData = getGateMetadata(c);
     if (gateData && gateData.reason_code === "uncertainty" && isBenign && !hasGravity) {
@@ -683,66 +758,64 @@ export const casesSummaryRoute: FastifyPluginAsync = async (app) => {
     }
 
     const isOperational = gateData?.reason_code === "documentation_risk" || gateData?.reason_code === "operational_chaos";
+
+    if (explicitNoVitals) { bpGap = true; tempGap = true; hrGap = true; spo2Gap = true; }
+
+    const clinicalHistory = enrichHistory();
+    const clinicalPlan = enrichPlan();
+    const requestedExams = enrichRequestedExams();
+    const auditedFindings = enrichFindings(clean(rawFindings));
+    const operationalNotes = enrichOperationalContext();
+
+    console.log("[DEBUG] Case ID:", c.id);
+    console.log("[DEBUG] text length:", text.length);
+    console.log("[DEBUG] sf exists:", !!sf);
+    console.log("[DEBUG] clinicalHistory:", clinicalHistory);
+    console.log("[DEBUG] clinicalPlan:", clinicalPlan);
+    console.log("[DEBUG] requestedExams:", requestedExams);
+    console.log("[DEBUG] auditedFindings:", auditedFindings);
+    console.log("[DEBUG] operationalNotes:", operationalNotes);
+
     const finalMissing: string[] = [];
     if (bpGap) finalMissing.push("PA objetiva (sistólica/diastólica)");
     if (tempGap) finalMissing.push("Temperatura (valor numérico ausente)");
     if (hrGap) finalMissing.push("FC objetiva (valor numérico ausente)");
     if (spo2Gap) finalMissing.push("SpO₂ numérica");
-    if (explicitNoVitals) finalMissing.push("Frequência Respiratória (FR)");
-    if (o2Gap) finalMissing.push("Uso/flow de oxigênio não documentado");
-    if (fluidGap) finalMissing.push("Fluidos/soro (não documentado)");
 
-    if (isOperational) {
-      const hasQP = text.includes("queixa") || text.includes("motivo") || (sf?.presenting_problem?.chief_complaint && sf.presenting_problem.chief_complaint.length > 3);
-      const hasPhysical = text.includes("exame") || text.includes("ausculta") || (sf?.physical_exam?.findings && sf.physical_exam.findings.length > 0);
-      const hasObjectiveVitals = hasNums || (sf?.vitals?.bp_systolic && sf?.vitals?.spo2_initial);
-
-      if (!hasQP) finalMissing.push("Motivo clínico da internação / queixa principal");
-      if (!hasPhysical) finalMissing.push("Exame físico objetivo");
-      if (!hasObjectiveVitals) finalMissing.push("Sinais vitais objetivos");
-    }
-    
     pendingSet.forEach(p => {
-      const pLow = p.toLowerCase();
-      // Filtra ruído de incertezas operacionais (ex: internado, fila, etc)
-      if (isOperational && /internado|fila|sistema|enfermagem|evolui/i.test(pLow)) return;
-      // Filtra o erro específico "Achado pulmonar vago: Paciente internado"
-      if (pLow.includes("achado pulmonar vago") && pLow.includes("internado")) return;
-
-      if (!finalMissing.some(f => pLow.includes(f.toLowerCase()))) {
-        finalMissing.push(p);
-      }
+       const pLow = p.toLowerCase();
+       if (requestedExams.some(re => pLow.includes(re.toLowerCase()))) return;
+       const allPlanItems = [...clinicalPlan.initiated, ...clinicalPlan.planned];
+       if (allPlanItems.some((cp: string) => pLow.includes(cp.toLowerCase()))) return;
+       if (clinicalHistory.some(ch => pLow.includes(ch.toLowerCase()))) return;
+       if (auditedFindings.some(af => pLow.includes(af.toLowerCase()))) return;
+       if (isOperational && /internado|fila|sistema|enfermagem|evolui/i.test(pLow)) return;
+       if (!finalMissing.some(f => pLow.includes(f.toLowerCase()))) finalMissing.push(p);
     });
 
     const vIn = sf?.vitals || null;
-    const ot = sf?.oxygen_therapy;
+    const otIn = sf?.oxygen_therapy;
     const hasIn = vIn?.spo2_initial;
     const hasOn = vIn?.spo2_on_o2;
 
-    let o2Label = "";
-    if (ot?.device) {
-      o2Label = `O₂ ${ot.device}`;
-      if (ot.flow_l_min) o2Label += ` ${ot.flow_l_min}L/min`;
-    } else if (ot?.flow_l_min) {
-      o2Label = `O₂ ${ot.flow_l_min}L/min`;
+    let o2L = "";
+    if (otIn?.device) {
+      o2L = `O₂ ${otIn.device}`;
+      if (otIn.flow_l_min) o2L += ` ${otIn.flow_l_min}L/min`;
+    } else if (otIn?.flow_l_min) {
+      o2L = `O₂ ${otIn.flow_l_min}L/min`;
     }
 
-    let spo2Value = null;
-    if (hasIn && hasOn) {
-      const labelOn = o2Label ? ` (${o2Label})` : "";
-      spo2Value = `${hasIn}% (AA) → ${hasOn}%${labelOn}`;
-    } else if (hasIn) {
-      spo2Value = `${hasIn}% (AA)`;
-    } else if (hasOn) {
-      const labelOn = o2Label ? ` (${o2Label})` : "";
-      spo2Value = `${hasOn}%${labelOn}`;
-    }
+    let spo2V = null;
+    if (hasIn && hasOn) spo2V = `${hasIn}% (AA) → ${hasOn}%${o2L ? ` (${o2L})` : ""}`;
+    else if (hasIn) spo2V = `${hasIn}% (AA)`;
+    else if (hasOn) spo2V = `${hasOn}%${o2L ? ` (${o2L})` : ""}`;
 
     const vitalsOut = vIn
       ? {
           ...vIn,
           fc: (vIn as any).fc ?? (vIn as any).hr ?? (vIn as any).heart_rate ?? null,
-          spo2: (spo2Value || (vIn as any).spo2 || (vIn as any).spo2_initial || null),
+          spo2: (spo2V || (vIn as any).spo2 || (vIn as any).spo2_initial || null),
         }
       : null;
 
@@ -751,18 +824,21 @@ export const casesSummaryRoute: FastifyPluginAsync = async (app) => {
     return reply.send({
       ok: true,
       case_id: c.id,
-      patient: {
-        ...(sf?.patient || {}),
-        name: patientHeader
-      },
+      patient: { ...(sf?.patient || {}), name: patientHeader },
       vitals: vitalsOut,
       gate: gateData,
       analysis: {
-        findings: uniqClean(enrichFindings(clean(rawFindings))),
+        findings: auditedFindings,
+        history: clinicalHistory,
+        initiated_interventions: clinicalPlan.initiated,
+        planned_interventions: clinicalPlan.planned.length > 0 ? clinicalPlan.planned : null,
+        // Manter plan para backward compatibility (pode ser removido depois que bot for atualizado)
+        plan: [...clinicalPlan.initiated, ...clinicalPlan.planned],
+        requested_exams: requestedExams,
+        operational_notes: operationalNotes.length > 0 ? operationalNotes : null,
         missing: uniqClean(clean(finalMissing)),
         uncertainties: finalUncertainties,
-        evidence_quality:
-          Object.keys(evidence_quality).length > 0 ? evidence_quality : null,
+        evidence_quality: Object.keys(evidence_quality).length > 0 ? evidence_quality : null,
       },
       clinical_scores: getClinicalScores(c),
       operational_context: sf?.operational_context || null,
