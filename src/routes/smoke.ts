@@ -30,7 +30,7 @@ const cases = [
   },
   {
     name: "soft_risk_no_trigger",
-    raw_text: "Paciente em PS com O2 em cateter, mas sem outras info.",
+    raw_text: "Paciente em PS com O₂ em cateter, mas sem outras info.",
     expect: { ranTeacher: false, reason: "skip_safe_case" },
   },
 ];
@@ -73,10 +73,10 @@ export async function smokeRoute(app: FastifyInstance) {
         teacherOk =
           !!B &&
           !!I &&
-          includesAny(B.findings, "SpO2") &&
-          includesAny(B.missing, "SpO2 target not documented") &&
-          includesAny(B.missing, "oxygen therapy status not documented") &&
-          includesAny(I.findings, "chief complaint:");
+          includesAny(B.findings, "SatO₂") &&
+          includesAny(B.missing, "Meta de saturação não registrada") &&
+          includesAny(B.missing, "Uso/fluxo de oxigênio não documentado") &&
+          includesAny(I.findings, "Queixa principal:");
 
         // ---------- Summary validation ----------
         const s = await app.inject({
@@ -88,8 +88,8 @@ export async function smokeRoute(app: FastifyInstance) {
         summaryOk =
           s.statusCode === 200 &&
           sb?.ok === true &&
-          typeof sb?.text === "string" &&
-          sb.text.includes("B");
+          Array.isArray(sb?.analysis?.findings) &&
+          sb.analysis.findings.some((x: string) => x.includes("SatO₂"));
       }
 
       if (c.name === "uncertainty_text") {
@@ -116,8 +116,8 @@ export async function smokeRoute(app: FastifyInstance) {
         summaryOk =
           s.statusCode === 200 &&
           sb?.ok === true &&
-          typeof sb?.text === "string" &&
-          sb.text.includes("K");
+          Array.isArray(sb?.analysis?.missing) &&
+          sb.analysis.missing.length > 0;
       }
 
       if (c.name === "safe_minimal") {
@@ -131,8 +131,7 @@ export async function smokeRoute(app: FastifyInstance) {
         summaryOk =
           s.statusCode === 200 &&
           sb?.ok === true &&
-          typeof sb?.text === "string" &&
-          sb.text.includes("Sem teacher_output.sections");
+          sb.analysis.findings.length === 0;
       }
 
       const ok =

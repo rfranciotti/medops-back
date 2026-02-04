@@ -70,3 +70,8 @@ export function getCaseById(caseId: string) {
     teacher_error: row.teacher_error ?? null,
   };
 }
+
+export function wipeCases() {
+  db.prepare(`DELETE FROM cases`).run();
+  db.prepare(`VACUUM`).run(); // opcional: compacta o sqlite
+}

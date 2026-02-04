@@ -38,12 +38,12 @@ export async function runTeacher(student_facts: any): Promise<TeacherOutput> {
         key: "B",
         title: "Breathing",
         findings: probs?.chief_complaint
-          ? [`chief complaint: ${probs.chief_complaint}`]
+          ? [`Queixa principal: ${probs.chief_complaint}`]
           : [],
         missing: [
           ...missingVitals,
-          "SpO2 target not documented",
-          "oxygen therapy status not documented",
+          "Meta de saturação não registrada",
+          "Uso/fluxo de oxigênio não documentado",
         ],
       },
       {
@@ -146,80 +146,65 @@ export async function runTeacherRules(student_facts: any) {
         key: "A",
         title: "Airway",
         findings: [],
-        missing: ["airway status not documented"],
+        missing: [],
       },
       {
         key: "B",
         title: "Breathing",
         findings: probs?.chief_complaint
-          ? [`chief complaint: ${probs.chief_complaint}`]
+          ? [`Queixa principal: ${probs.chief_complaint}`]
           : [],
-        missing: [
-          ...missingVitals,
-          "SpO2 target not documented",
-          "oxygen therapy status not documented",
-        ],
+        missing: [],
       },
       {
         key: "C",
         title: "Circulation",
         findings: [],
-        missing: [
-          ...missingVitals,
-          "BP/HR not documented",
-          "IV access/fluids not documented",
-        ],
+        missing: [],
       },
       {
         key: "D",
         title: "Disability",
         findings: [],
-        missing: ["neuro status (GCS/orientation) not documented"],
+        missing: [],
       },
       {
         key: "E",
         title: "Exposure",
         findings: [],
-        missing: [
-          "temperature not documented",
-          "focused exam summary not documented",
-        ],
+        missing: [],
       },
       {
         key: "F",
         title: "Labs/Imaging",
-        findings:
-          Array.isArray(exams) && exams.length ? ["exams mentioned"] : [],
-        missing: ["no explicit labs/imaging listed"],
+        findings: [],
+        missing: [],
       },
       {
         key: "G",
         title: "Medications",
-        findings:
-          Array.isArray(meds) && meds.length ? ["medications mentioned"] : [],
-        missing: ["medication list/timing not documented"],
+        findings: [],
+        missing: [],
       },
       {
         key: "H",
         title: "Allergies",
         findings: [],
-        missing: ["allergies not documented"],
+        missing: [],
       },
       {
         key: "I",
         title: "Problem List",
         findings: probs?.chief_complaint
-          ? [`presenting problem: ${probs.chief_complaint}`]
+          ? [`Queixa principal: ${probs.chief_complaint}`]
           : [],
-        missing: [
-          "differential/working impression not documented (ok to omit, but should be explicit)",
-        ],
+        missing: [],
       },
       {
         key: "J",
         title: "Plan/Next Steps (documentation gaps only)",
         findings: [],
-        missing: ["no documented plan/checklist items"],
+        missing: [],
       },
       {
         key: "K",
@@ -229,11 +214,7 @@ export async function runTeacherRules(student_facts: any) {
           student_facts.uncertainties.length
             ? ["uncertainties present in notes"]
             : [],
-        missing:
-          Array.isArray(student_facts?.uncertainties) &&
-          student_facts.uncertainties.length
-            ? []
-            : ["uncertainties not explicitly addressed"],
+        missing: [],
       },
     ],
     meta: {
@@ -243,33 +224,53 @@ export async function runTeacherRules(student_facts: any) {
   };
 }
 
-export async function runTeacherWithMeta(student_facts: any) {
+import { enforceTeacherSectionK } from "./anti-evasion.js";
+
+export async function runTeacherWithMeta(
+  student_facts: any,
+  raw_text?: string,
+) {
   const provider = process.env.TEACHER_PROVIDER || "rules";
 
+  const uncertainties: string[] = Array.isArray(student_facts?.uncertainties)
+    ? student_facts.uncertainties
+    : [];
+
   if (provider === "rules") {
+    const teacher = await runTeacherRules(student_facts);
     return {
-      teacher: await runTeacherRules(student_facts),
-      providerUsed: "rules",
+      teacher: enforceTeacherSectionK(teacher, uncertainties),
+      providerUsed: "rules_patched",
       error: null as string | null,
     };
   }
 
   if (provider === "groq") {
     try {
-      const t = await runTeacherGroq(student_facts);
-      return { teacher: t, providerUsed: "groq", error: null as string | null };
-    } catch (e: any) {
+      const t = await runTeacherGroq(student_facts, raw_text);
+
+      // ✅ Se Groq “não denunciar”, a gente injeta no K mesmo assim
+      const patched = enforceTeacherSectionK(t, uncertainties);
+
       return {
-        teacher: await runTeacherRules(student_facts),
-        providerUsed: "rules_fallback",
+        teacher: patched,
+        providerUsed: "groq_patched",
+        error: null as string | null,
+      };
+    } catch (e: any) {
+      const fallback = await runTeacherRules(student_facts);
+      return {
+        teacher: enforceTeacherSectionK(fallback, uncertainties),
+        providerUsed: "rules_fallback_patched",
         error: String(e?.message || e),
       };
     }
   }
 
+  const teacher = await runTeacherRules(student_facts);
   return {
-    teacher: await runTeacherRules(student_facts),
-    providerUsed: "rules",
+    teacher: enforceTeacherSectionK(teacher, uncertainties),
+    providerUsed: "rules_patched",
     error: `unsupported provider ${provider}`,
   };
 }

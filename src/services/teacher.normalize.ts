@@ -36,30 +36,37 @@ export function normalizeTeacherOutput(
     I.missing = Array.isArray(I.missing) ? I.missing : [];
   }
 
-  // Hard-risk minimums
+  // Hard-risk minimums (REMOVIDO: viola contrato de não inventar pendências não citadas)
+  /*
   if (Number.isFinite(spo2) && spo2 < 92 && B) {
-    // Prefer the more specific "on room air" if it already exists
-    const hasRoomAir = B.findings.some(
-      (x: any) => typeof x === "string" && /on room air/i.test(x),
+    // Normaliza para SatO₂ e evita duplicidade com SpO2 ou outras grafias
+    const hasSat = B.findings.some(
+      (x: any) => typeof x === "string" && /(SpO₂|SatO₂|Saturação)/i.test(x),
     );
-    if (!hasRoomAir) uniqPush(B.findings, `SpO2: ${spo2}%`);
-    // If it already had "SpO2: 89% on room air", don't add the generic duplicate
-    if (hasRoomAir) {
-      removeIfPresent(B.findings, `SpO2: ${spo2}%`);
+
+    if (!hasSat) {
+      uniqPush(B.findings, `SatO₂: ${spo2}%`);
     }
 
-    // Missing fields (standardized)
-    uniqPush(B.missing, "SpO2 target not documented");
-    uniqPush(B.missing, "oxygen therapy status not documented");
-    uniqPush(B.missing, "RR not documented");
+    // Pendências em Português
+    uniqPush(B.missing, "Meta de saturação não registrada");
+    uniqPush(B.missing, "Uso/fluxo de oxigênio não documentado");
+    uniqPush(B.missing, "Frequência respiratória não registrada");
 
-    // Remove vague duplicate if present
+    // Remove duplicatas em inglês ou variações (plural) se o LLM tiver mandado
+    removeIfPresent(B.missing, "SpO₂ target not documented");
+    removeIfPresent(B.missing, "SpO2 target not documented");
+    removeIfPresent(B.missing, "Metas de saturação não registradas");
+    removeIfPresent(B.missing, "Meta de saturação não documentada");
+    removeIfPresent(B.missing, "oxygen therapy status not documented");
+    removeIfPresent(B.missing, "RR not documented");
     removeIfPresent(B.missing, "oxygen status");
   }
+  */
 
   // Problem list minimum
   if (cc && I) {
-    uniqPush(I.findings, `chief complaint: ${cc}`);
+    uniqPush(I.findings, `Queixa principal: ${cc}`);
   }
 
   const K = sec("K");
@@ -71,9 +78,73 @@ export function normalizeTeacherOutput(
   if (gate?.reason === "uncertainty" && K) {
     uniqPush(
       K.missing,
-      "uncertainty trigger: source text contains hedging (review required)",
+      "Gatilho de incerteza: o texto contém termos de dúvida (revisão necessária)",
     );
   }
+
+  // ========== LIMPEZA FINAL (Post-processing conservador) ==========
+
+  const raw_text = (student_facts?.context?.raw_text || "").toLowerCase();
+
+  out.sections?.forEach((section: any) => {
+    if (!section) return;
+
+    section.findings = Array.isArray(section.findings) ? section.findings : [];
+    section.missing = Array.isArray(section.missing) ? section.missing : [];
+
+    // 1️⃣ Remove duplicatas entre findings e missing da MESMA seção
+    section.findings = section.findings.filter(
+      (f: string) => !section.missing.includes(f),
+    );
+
+    // 2️⃣ Move frases de incerteza de findings para K.findings (se não for seção K)
+    if (section.key !== "K") {
+      const uncertaintyPatterns =
+        /\b(desconfio|não sei|talvez|incerto|dúvida|será que|suspeito)\b/i;
+      const uncertainFindings: string[] = [];
+
+      section.findings = section.findings.filter((f: string) => {
+        if (typeof f === "string" && uncertaintyPatterns.test(f)) {
+          uncertainFindings.push(f);
+          return false; // Remove de findings
+        }
+        return true;
+      });
+
+      // Adiciona na seção K
+      if (K && uncertainFindings.length > 0) {
+        uncertainFindings.forEach((u) => uniqPush(K.findings, u));
+      }
+    }
+
+    // 3️⃣ Remove pedidos irrelevantes de "missing"
+    if (section.key === "E") {
+      // Exposure
+      // Remove "Local de atendimento" se menciona PS/UPA/Hospital
+      if (/\b(ps|upa|pronto.socorro|hospital|emergencia)\b/i.test(raw_text)) {
+        section.missing = section.missing.filter(
+          (m: string) => !/local de atendimento/i.test(m),
+        );
+      }
+
+      // Remove "Data de referência" (sempre será a data do registro)
+      section.missing = section.missing.filter(
+        (m: string) => !/data de refer[eê]ncia/i.test(m),
+      );
+    }
+
+    // 4️⃣ Remove duplicatas de "Queixa principal" na seção I
+    if (section.key === "I" && cc) {
+      const queixaPrincipalItem = `Queixa principal: ${cc}`;
+
+      // Se já tem "Queixa principal: X", remove "X" solto
+      if (section.findings.includes(queixaPrincipalItem)) {
+        section.findings = section.findings.filter(
+          (f: string) => f === queixaPrincipalItem || f !== cc,
+        );
+      }
+    }
+  });
 
   return out;
 }
